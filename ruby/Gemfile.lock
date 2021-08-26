@@ -1,0 +1,47 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    dalli (2.7.11)
+    foreman (0.87.2)
+    kgio (2.11.3)
+    multi_json (1.15.0)
+    mustermann (1.1.1)
+      ruby2_keywords (~> 0.0.1)
+    mysql2 (0.5.3)
+    rack (2.2.3)
+    rack-flash3 (1.0.5)
+      rack
+    rack-protection (2.1.0)
+      rack
+    raindrops (0.19.1)
+    ruby2_keywords (0.0.4)
+    sinatra (2.1.0)
+      mustermann (~> 1.0)
+      rack (~> 2.2)
+      rack-protection (= 2.1.0)
+      tilt (~> 2.0)
+    sinatra-contrib (2.1.0)
+      multi_json
+      mustermann (~> 1.0)
+      rack-protection (= 2.1.0)
+      sinatra (= 2.1.0)
+      tilt (~> 2.0)
+    tilt (2.0.10)
+    unicorn (6.0.0)
+      kgio (~> 2.6)
+      raindrops (~> 0.7)
+
+PLATFORMS
+  x86_64-linux
+
+DEPENDENCIES
+  dalli
+  foreman
+  mysql2
+  rack-flash3
+  sinatra
+  sinatra-contrib
+  unicorn
+
+BUNDLED WITH
+   2.2.16
