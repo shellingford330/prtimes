@@ -3,7 +3,7 @@ services:
   nginx:
     image: nginx:1.20.0
     volumes:
-      - ./etc/nginx/conf.d:/etc/nginx/conf.d
+      - ./etc/nginx/nginx.conf:/etc/nginx/nginx.conf
       - ./public:/public
     ports:
       - "80:80"
