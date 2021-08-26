@@ -27,8 +27,6 @@ services:
       - memcached
     volumes:
       - ./public:/home/public
-      - ./golang:/home/webapp/golang
-      - ./etc:/home/webapp/etc
     init: true
 
   mysql:
