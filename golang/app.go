@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -30,6 +32,7 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+	count sync.Map
 )
 
 const (
@@ -54,7 +57,7 @@ type Post struct {
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
 	CreatedAt    time.Time `db:"created_at"`
-	CommentCount int
+	CommentCount int       `db:"count"`
 	Comments     []Comment
 	User         User `db:"user"`
 	CSRFToken    string
@@ -179,17 +182,25 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 	for _, p := range results {
 		// TODO: キャッシュする
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		// err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		value, ok := count.Load(p.ID)
+		if !ok {
+			return nil, errors.New("cannot load post's comment count")
+		}
+		p.CommentCount, ok = value.(int)
+		if !ok {
+			return nil, errors.New("failed to type assertion of comment count")
 		}
 
-		query := "SELECT `comments`.`comment` AS `comment`, `comments`.`created_at` AS `created_at`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `comments` INNER JOIN `users` ON `users`.`id` = `comments`.`user_id` WHERE `post_id` = ? ORDER BY `created_at` DESC"
+		query := "SELECT `comments`.`comment` AS `comment`, `comments`.`created_at` AS `created_at`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `comments` INNER JOIN `users` ON `users`.`id` = `comments`.`user_id` WHERE `comments`.`post_id` = ? ORDER BY `comments`.`created_at` DESC"
 		if !allComments {
 			query += " LIMIT 3"
 		}
 		var comments []Comment
-		err = db.Select(&comments, query, p.ID)
+		err := db.Select(&comments, query, p.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -680,6 +691,8 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	count.Store(int(pid), 0)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -739,6 +752,18 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
+
+	value, ok := count.Load(postID)
+	if !ok {
+		log.Print("cannot load comment count")
+		return
+	}
+	commentCount, ok := value.(int)
+	if !ok {
+		log.Print("failed to type assertion")
+		return
+	}
+	count.Store(postID, commentCount+1)
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -866,6 +891,15 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	posts := []Post{}
+	err = db.Select(&posts, "SELECT `posts`.`id` AS `id`, COUNT(`comments`.`id`) AS `count` FROM `posts` LEFT JOIN `comments` ON `posts`.`id` = `comments`.`post_id` GROUP BY `posts`.`id`")
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	for _, p := range posts {
+		count.Store(p.ID, p.CommentCount)
+	}
 
 	mux := goji.NewMux()
 
