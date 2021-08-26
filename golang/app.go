@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -539,7 +540,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `posts`.`id` AS `id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` AS `users` ON `users`.`id` = `posts`.`user_id` WHERE `posts`.`created_at` <= ? AND `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC  LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+	err = db.Select(&results, "SELECT `posts`.`id` AS `id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `posts`.`created_at` <= ? AND `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC  LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -677,7 +678,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		filedata,
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -693,10 +694,25 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 
 	count.Store(int(pid), 0)
 
+	ext := ""
+	if mime == "image/jpeg" {
+		ext = "jpg"
+	} else if mime == "image/png" {
+		ext = "png"
+	} else if mime == "image/gif" {
+		ext = "gif"
+	}
+	err = ioutil.WriteFile(fmt.Sprintf("../public/image/%d.%s", pid, ext), filedata, 0644)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
 func getImage(w http.ResponseWriter, r *http.Request) {
+	log.Print("check get image")
 	pidStr := pat.Param(r, "id")
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil {
@@ -704,8 +720,8 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	post := Post{}
-	err = db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	mime := ""
+	err = db.Get(&mime, "SELECT mime FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -713,11 +729,17 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 
 	ext := pat.Param(r, "ext")
 
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+	if ext == "jpg" && mime == "image/jpeg" ||
+		ext == "png" && mime == "image/png" ||
+		ext == "gif" && mime == "image/gif" {
+		w.Header().Set("Content-Type", mime)
+
+		filedata, err := ioutil.ReadFile(fmt.Sprintf("../public/image/%d.%s", pid, ext))
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		_, err = w.Write(filedata)
 		if err != nil {
 			log.Print(err)
 			return
@@ -893,12 +915,29 @@ func main() {
 	defer db.Close()
 
 	posts := []Post{}
-	err = db.Select(&posts, "SELECT `posts`.`id` AS `id`, COUNT(`comments`.`id`) AS `count` FROM `posts` LEFT JOIN `comments` ON `posts`.`id` = `comments`.`post_id` GROUP BY `posts`.`id`")
+	err = db.Select(&posts, "SELECT `posts`.`id` AS `id`, COUNT(`comments`.`id`) AS `count`, `posts`.`mime` AS `mime`, `posts`.`imgdata` AS `imgdata` FROM `posts` LEFT JOIN `comments` ON `posts`.`id` = `comments`.`post_id` GROUP BY `posts`.`id`")
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	for _, p := range posts {
+		ext := ""
+		if p.Mime == "image/jpeg" {
+			ext = "jpg"
+		} else if p.Mime == "image/png" {
+			ext = "png"
+		} else if p.Mime == "image/gif" {
+			ext = "gif"
+		}
+		err = ioutil.WriteFile(fmt.Sprintf("../public/image/%d.%s", p.ID, ext), p.Imgdata, 0644)
+		if err != nil {
+			log.Fatalf("Failed to write image data to file: %s.", err.Error())
+		}
 		count.Store(p.ID, p.CommentCount)
+	}
+
+	_, err = db.Exec("UPDATE `posts` SET imgdata=?", "")
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 
 	mux := goji.NewMux()
@@ -920,5 +959,6 @@ func main() {
 	mux.HandleFunc(Regexp(regexp.MustCompile(`^/@(?P<accountName>[a-zA-Z]+)$`)), getAccountName)
 	mux.Handle(pat.Get("/*"), http.FileServer(http.Dir("../public")))
 
+	log.Print("ready for running server")
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
