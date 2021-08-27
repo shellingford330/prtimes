@@ -31,9 +31,10 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	store *gsm.MemcacheStore
-	count sync.Map
+	db       *sqlx.DB
+	store    *gsm.MemcacheStore
+	count    sync.Map
+	postMime sync.Map
 )
 
 const (
@@ -693,6 +694,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	count.Store(int(pid), 0)
+	postMime.Store(int(pid), mime)
 
 	ext := ""
 	if mime == "image/jpeg" {
@@ -720,9 +722,19 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mime := ""
-	err = db.Get(&mime, "SELECT mime FROM `posts` WHERE `id` = ?", pid)
-	if err != nil {
+	// mime := ""
+	// err = db.Get(&mime, "SELECT mime FROM `posts` WHERE `id` = ?", pid)
+	// if err != nil {
+	// 	log.Print(err)
+	// 	return
+	// }
+	value, ok := postMime.Load(pid)
+	if !ok {
+		log.Print(err)
+		return
+	}
+	mime, ok := value.(string)
+	if !ok {
 		log.Print(err)
 		return
 	}
@@ -933,6 +945,7 @@ func main() {
 			log.Fatalf("Failed to write image data to file: %s.", err.Error())
 		}
 		count.Store(p.ID, p.CommentCount)
+		postMime.Store(p.ID, p.Mime)
 	}
 
 	_, err = db.Exec("UPDATE `posts` SET imgdata=?", "")
