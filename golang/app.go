@@ -33,12 +33,13 @@ import (
 )
 
 var (
-	db        *sqlx.DB
-	store     *gsm.MemcacheStore
-	count     sync.Map
-	postMime  sync.Map
-	tplCache  sync.Map
-	userCache sync.Map
+	db               *sqlx.DB
+	store            *gsm.MemcacheStore
+	count            sync.Map
+	postMime         sync.Map
+	tplCache         sync.Map
+	userCache        sync.Map
+	userCommentCache sync.Map
 )
 
 const (
@@ -184,7 +185,7 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string) ([]Post, error) {
-	var posts []Post
+	posts := make([]Post, 0, postsPerPage)
 
 	for _, p := range results {
 		// TODO: キャッシュする
@@ -402,6 +403,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		Authority:   0,
 		AccountName: accountName,
 	})
+	userCommentCache.Store(int(uid), 0)
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -495,12 +497,19 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		posts[i].User = user
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
-	if err != nil {
+	value, ok := userCommentCache.Load(user.ID)
+	if !ok {
 		log.Print(err)
 		return
 	}
+	commentCount := value.(int)
+
+	// commentCount := 0
+	// err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// if err != nil {
+	// 	log.Print(err)
+	// 	return
+	// }
 
 	postIDs := []int{}
 	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
@@ -511,29 +520,37 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	postCount := len(postIDs)
 
 	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
+	for _, postID := range postIDs {
+		value, ok := count.Load(postID)
+		if !ok {
 			log.Print(err)
 			return
 		}
+		commentCount += value.(int)
 	}
+	// if postCount > 0 {
+	// 	s := []string{}
+	// 	for range postIDs {
+	// 		s = append(s, "?")
+	// 	}
+	// 	placeholder := strings.Join(s, ", ")
+
+	// 	// convert []int -> []interface{}
+	// 	args := make([]interface{}, len(postIDs))
+	// 	for i, v := range postIDs {
+	// 		args[i] = v
+	// 	}
+
+	// 	err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+	// 	if err != nil {
+	// 		log.Print(err)
+	// 		return
+	// 	}
+	// }
 
 	me := getSessionUser(r)
 
-	value, ok := tplCache.Load("getAccountName")
+	value, ok = tplCache.Load("getAccountName")
 	if ok {
 		tpl := value.(*template.Template)
 		tpl.Execute(w, struct {
@@ -854,6 +871,14 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 	count.Store(postID, commentCount+1)
 
+	value, ok = count.Load(me.ID)
+	if !ok {
+		log.Print("cannot load user comment count")
+		return
+	}
+	commentCount = value.(int)
+	count.Store(me.ID, commentCount+1)
+
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
@@ -994,6 +1019,7 @@ func main() {
 	}
 	defer db.Close()
 
+	// Postのキャッシュ作成
 	posts := []Post{}
 	err = db.Select(&posts, "SELECT `posts`.`id` AS `id`, COUNT(`comments`.`id`) AS `count`, `posts`.`mime` AS `mime`, `posts`.`imgdata` AS `imgdata` FROM `posts` LEFT JOIN `comments` ON `posts`.`id` = `comments`.`post_id` GROUP BY `posts`.`id`")
 	if err != nil {
@@ -1016,6 +1042,7 @@ func main() {
 		postMime.Store(p.ID, p.Mime)
 	}
 
+	// Userのキャッシュ作成
 	users := []User{}
 	err = db.Select(&users, "SELECT * FROM `users`")
 	if err != nil {
@@ -1023,6 +1050,19 @@ func main() {
 	}
 	for _, user := range users {
 		userCache.Store(user.ID, user)
+	}
+
+	// Commentのキャッシュ作成
+	commentCounts := []struct {
+		UserID       int `db:"user_id"`
+		CommentCount int `db:"count"`
+	}{}
+	err = db.Select(&commentCounts, "SELECT `user_id`, COUNT(id) AS count FROM `comments` GROUP BY `user_id`")
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	for _, commentCount := range commentCounts {
+		userCommentCache.Store(commentCount.UserID, commentCount.CommentCount)
 	}
 
 	go func() {
