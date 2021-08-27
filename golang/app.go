@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	_ "net/http/pprof"
+	// _ "net/http/pprof"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
@@ -1065,9 +1065,9 @@ func main() {
 		userCommentCache.Store(commentCount.UserID, commentCount.CommentCount)
 	}
 
-	go func() {
-		log.Println(http.ListenAndServe(":6060", nil))
-	}()
+	// go func() {
+	// 	log.Println(http.ListenAndServe(":6060", nil))
+	// }()
 
 	mux := goji.NewMux()
 
