@@ -22,11 +22,13 @@ services:
       ISUCONP_DB_PASSWORD: root
       ISUCONP_DB_NAME: isuconp
       ISUCONP_MEMCACHED_ADDRESS: memcached:11211
-    links:
+    depends_on:
       - mysql
       - memcached
     volumes:
       - ./public:/home/public
+    ports:
+      - "6060:6060"
     init: true
 
   mysql:
