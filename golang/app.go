@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	// _ "net/http/pprof"
+
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 	_ "github.com/go-sql-driver/mysql"
@@ -31,10 +33,13 @@ import (
 )
 
 var (
-	db       *sqlx.DB
-	store    *gsm.MemcacheStore
-	count    sync.Map
-	postMime sync.Map
+	db               *sqlx.DB
+	store            *gsm.MemcacheStore
+	count            sync.Map
+	postMime         sync.Map
+	tplCache         sync.Map
+	userCache        sync.Map
+	userCommentCache sync.Map
 )
 
 const (
@@ -179,8 +184,8 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+func makePosts(results []Post, csrfToken string) ([]Post, error) {
+	posts := make([]Post, 0, postsPerPage)
 
 	for _, p := range results {
 		// TODO: キャッシュする
@@ -197,14 +202,19 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			return nil, errors.New("failed to type assertion of comment count")
 		}
 
-		query := "SELECT `comments`.`comment` AS `comment`, `comments`.`created_at` AS `created_at`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `comments` INNER JOIN `users` ON `users`.`id` = `comments`.`user_id` WHERE `comments`.`post_id` = ? ORDER BY `comments`.`created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
+		query := "SELECT `comment`, `user_id` FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC LIMIT 3"
 		var comments []Comment
 		err := db.Select(&comments, query, p.ID)
 		if err != nil {
 			return nil, err
+		}
+
+		for _, comment := range comments {
+			value, ok := userCache.Load(comment.UserID)
+			if !ok {
+				return nil, errors.New("cannot load comment's user")
+			}
+			comment.User = value.(User)
 		}
 
 		// for i := 0; i < len(comments); i++ {
@@ -387,6 +397,14 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
 
+	userCache.Store(int(uid), User{
+		ID:          int(uid),
+		DelFlg:      0,
+		Authority:   0,
+		AccountName: accountName,
+	})
+	userCommentCache.Store(int(uid), 0)
+
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -402,17 +420,29 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
+	posts := []Post{}
 
-	err := db.Select(&results, "SELECT `posts`.`id` AS `id`, `posts`.`user_id` AS `user_id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ?", postsPerPage)
+	err := db.Select(&posts, "SELECT `posts`.`id` AS `id`, `posts`.`user_id` AS `user_id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err = makePosts(posts, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
+		return
+	}
+
+	value, ok := tplCache.Load("getIndex")
+	if ok {
+		tpl := value.(*template.Template)
+		tpl.Execute(w, struct {
+			Posts     []Post
+			Me        User
+			CSRFToken string
+			Flash     string
+		}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 		return
 	}
 
@@ -420,17 +450,19 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		"imageURL": imageURL,
 	}
 
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	tpl := template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("index.html"),
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	))
+	tpl.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
 	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	tplCache.Store("getIndex", tpl)
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -456,7 +488,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -465,12 +497,19 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		posts[i].User = user
 	}
 
-	commentCount := 0
-	err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
-	if err != nil {
+	value, ok := userCommentCache.Load(user.ID)
+	if !ok {
 		log.Print(err)
 		return
 	}
+	commentCount := value.(int)
+
+	// commentCount := 0
+	// err = db.Get(&commentCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?", user.ID)
+	// if err != nil {
+	// 	log.Print(err)
+	// 	return
+	// }
 
 	postIDs := []int{}
 	err = db.Select(&postIDs, "SELECT `id` FROM `posts` WHERE `user_id` = ?", user.ID)
@@ -481,38 +520,61 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	postCount := len(postIDs)
 
 	commentedCount := 0
-	if postCount > 0 {
-		s := []string{}
-		for range postIDs {
-			s = append(s, "?")
-		}
-		placeholder := strings.Join(s, ", ")
-
-		// convert []int -> []interface{}
-		args := make([]interface{}, len(postIDs))
-		for i, v := range postIDs {
-			args[i] = v
-		}
-
-		err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
-		if err != nil {
+	for _, postID := range postIDs {
+		value, ok := count.Load(postID)
+		if !ok {
 			log.Print(err)
 			return
 		}
+		commentCount += value.(int)
 	}
+	// if postCount > 0 {
+	// 	s := []string{}
+	// 	for range postIDs {
+	// 		s = append(s, "?")
+	// 	}
+	// 	placeholder := strings.Join(s, ", ")
+
+	// 	// convert []int -> []interface{}
+	// 	args := make([]interface{}, len(postIDs))
+	// 	for i, v := range postIDs {
+	// 		args[i] = v
+	// 	}
+
+	// 	err = db.Get(&commentedCount, "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN ("+placeholder+")", args...)
+	// 	if err != nil {
+	// 		log.Print(err)
+	// 		return
+	// 	}
+	// }
 
 	me := getSessionUser(r)
+
+	value, ok = tplCache.Load("getAccountName")
+	if ok {
+		tpl := value.(*template.Template)
+		tpl.Execute(w, struct {
+			Posts          []Post
+			User           User
+			PostCount      int
+			CommentCount   int
+			CommentedCount int
+			Me             User
+		}{posts, user, postCount, commentCount, commentedCount, me})
+		return
+	}
 
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
 	}
 
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	tpl := template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("user.html"),
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	))
+	tpl.Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -520,6 +582,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		CommentedCount int
 		Me             User
 	}{posts, user, postCount, commentCount, commentedCount, me})
+	tplCache.Store("getAccountName", tpl)
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -547,7 +610,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -558,14 +621,23 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	value, ok := tplCache.Load("getPosts")
+	if ok {
+		tpl := value.(*template.Template)
+		tpl.Execute(w, posts)
+		return
+	}
+
 	fmap := template.FuncMap{
 		"imageURL": imageURL,
 	}
 
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+	tpl := template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
 		getTemplPath("posts.html"),
 		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	))
+	tpl.Execute(w, posts)
+	tplCache.Store("getPosts", tpl)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -583,7 +655,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	posts, err := makePosts(results, getCSRFToken(r), true)
+	posts, err := makePosts(results, getCSRFToken(r))
 	if err != nil {
 		log.Print(err)
 		return
@@ -799,6 +871,14 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 	}
 	count.Store(postID, commentCount+1)
 
+	value, ok = count.Load(me.ID)
+	if !ok {
+		log.Print("cannot load user comment count")
+		return
+	}
+	commentCount = value.(int)
+	count.Store(me.ID, commentCount+1)
+
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
 
@@ -815,7 +895,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	users := []User{}
-	err := db.Select(&users, "SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
+	err := db.Select(&users, "SELECT `id`, `account_name` FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC")
 	if err != nil {
 		log.Print(err)
 		return
@@ -858,6 +938,19 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.Exec(query, 1, id)
+		id, err := strconv.Atoi(id)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		value, ok := userCache.Load(id)
+		if !ok {
+			log.Print(err)
+			return
+		}
+		user := value.(User)
+		user.DelFlg = 1
+		userCache.Store(id, user)
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
@@ -926,6 +1019,7 @@ func main() {
 	}
 	defer db.Close()
 
+	// Postのキャッシュ作成
 	posts := []Post{}
 	err = db.Select(&posts, "SELECT `posts`.`id` AS `id`, COUNT(`comments`.`id`) AS `count`, `posts`.`mime` AS `mime`, `posts`.`imgdata` AS `imgdata` FROM `posts` LEFT JOIN `comments` ON `posts`.`id` = `comments`.`post_id` GROUP BY `posts`.`id`")
 	if err != nil {
@@ -948,10 +1042,32 @@ func main() {
 		postMime.Store(p.ID, p.Mime)
 	}
 
-	_, err = db.Exec("UPDATE `posts` SET imgdata=?", "")
+	// Userのキャッシュ作成
+	users := []User{}
+	err = db.Select(&users, "SELECT * FROM `users`")
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
+	for _, user := range users {
+		userCache.Store(user.ID, user)
+	}
+
+	// Commentのキャッシュ作成
+	commentCounts := []struct {
+		UserID       int `db:"user_id"`
+		CommentCount int `db:"count"`
+	}{}
+	err = db.Select(&commentCounts, "SELECT `user_id`, COUNT(id) AS count FROM `comments` GROUP BY `user_id`")
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	for _, commentCount := range commentCounts {
+		userCommentCache.Store(commentCount.UserID, commentCount.CommentCount)
+	}
+
+	// go func() {
+	// 	log.Println(http.ListenAndServe(":6060", nil))
+	// }()
 
 	mux := goji.NewMux()
 
