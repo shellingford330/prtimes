@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	// _ "net/http/pprof"
+	_ "net/http/pprof"
 
 	"github.com/bradfitz/gomemcache/memcache"
 	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
@@ -40,6 +40,7 @@ var (
 	tplCache         sync.Map
 	userCache        sync.Map
 	userCommentCache sync.Map
+	fmap             = template.FuncMap{"imageURL": imageURL}
 )
 
 const (
@@ -96,6 +97,8 @@ func dbInitialize() {
 		"DELETE FROM comments WHERE id > 100000",
 		"UPDATE users SET del_flg = 0",
 		"UPDATE users SET del_flg = 1 WHERE id % 50 = 0",
+		"UPDATE posts SET user_del_flg = 0",
+		"UPDATE posts SET user_del_flg = 1 WHERE user_id % 50 = 0",
 	}
 
 	for _, sql := range sqls {
@@ -161,12 +164,18 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
-
-	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	value, ok := userCache.Load(uid.(int))
+	if !ok {
 		return User{}
 	}
+	u := value.(User)
+
+	// u := User{}
+
+	// err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	// if err != nil {
+	// 	return User{}
+	// }
 
 	return u
 }
@@ -393,7 +402,7 @@ func postRegister(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-	session.Values["user_id"] = uid
+	session.Values["user_id"] = int(uid)
 	session.Values["csrf_token"] = secureRandomStr(16)
 	session.Save(r, w)
 
@@ -422,7 +431,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	posts := []Post{}
 
-	err := db.Select(&posts, "SELECT `posts`.`id` AS `id`, `posts`.`user_id` AS `user_id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC LIMIT ?", postsPerPage)
+	err := db.Select(&posts, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_del_flg` = 0 ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -432,6 +441,16 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	for i := range posts {
+		value, ok := userCache.Load(posts[i].UserID)
+		if !ok {
+			log.Print(err)
+			return
+		}
+		user := value.(User)
+		posts[i].User = user
 	}
 
 	value, ok := tplCache.Load("getIndex")
@@ -444,10 +463,6 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 			Flash     string
 		}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 		return
-	}
-
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
 	}
 
 	tpl := template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
@@ -564,10 +579,6 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
 	tpl := template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
 		getTemplPath("user.html"),
@@ -604,7 +615,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `posts`.`id` AS `id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `users`.`id` = `posts`.`user_id` WHERE `posts`.`created_at` <= ? AND `users`.`del_flg` = 0 ORDER BY `posts`.`created_at` DESC  LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+	err = db.Select(&results, "SELECT `id`, `body`, `mime`, `created_at`, `user_id` FROM `posts` WHERE `created_at` <= ? AND `user_del_flg` = 0 ORDER BY `created_at` DESC  LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -614,6 +625,16 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Print(err)
 		return
+	}
+
+	for i := range posts {
+		value, ok := userCache.Load(posts[i].UserID)
+		if !ok {
+			log.Print(err)
+			return
+		}
+		user := value.(User)
+		posts[i].User = user
 	}
 
 	if len(posts) == 0 {
@@ -626,10 +647,6 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		tpl := value.(*template.Template)
 		tpl.Execute(w, posts)
 		return
-	}
-
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
 	}
 
 	tpl := template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
@@ -649,9 +666,14 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `posts`.`id` AS `id`, `posts`.`body` AS `body`, `posts`.`mime` AS `mime`, `posts`.`created_at` AS `created_at`, `users`.`id` AS `user.id`, `users`.`account_name` AS `user.account_name`, `users`.`created_at` AS `user.created_at` FROM `posts` INNER JOIN `users` ON `posts`.`user_id` = `users`.`id` WHERE `posts`.`id` = ? AND `users`.`del_flg` = 0 LIMIT 1", pid)
+	err = db.Select(&results, "SELECT `id`, `body`, `mime`, `created_at`, `user_id` FROM `posts` WHERE `id` = ? AND `user_del_flg` = 0 LIMIT 1", pid)
 	if err != nil {
 		log.Print(err)
+		return
+	}
+
+	if len(results) == 0 {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -661,9 +683,14 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(posts) == 0 {
-		w.WriteHeader(http.StatusNotFound)
-		return
+	for i := range posts {
+		value, ok := userCache.Load(posts[i].UserID)
+		if !ok {
+			log.Print(err)
+			return
+		}
+		user := value.(User)
+		posts[i].User = user
 	}
 
 	p := posts[0]
@@ -674,10 +701,6 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	me := getSessionUser(r)
-
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
 
 	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
 		getTemplPath("layout.html"),
@@ -746,13 +769,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`, `user_del_flg`) VALUES (?,?,?,?,?)"
 	result, err := db.Exec(
 		query,
 		me.ID,
 		mime,
 		"",
 		r.FormValue("body"),
+		me.DelFlg,
 	)
 	if err != nil {
 		log.Print(err)
@@ -928,16 +952,32 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "UPDATE `users` SET `del_flg` = ? WHERE `id` = ?"
-
 	err := r.ParseForm()
 	if err != nil {
 		log.Print(err)
 		return
 	}
 
+	if len(r.Form["uid[]"]) > 0 {
+		s := []string{}
+		for range r.Form["uid[]"] {
+			s = append(s, "?")
+		}
+		placeholder := strings.Join(s, ", ")
+
+		args := make([]interface{}, len(r.Form["uid[]"]))
+		for i, v := range r.Form["uid[]"] {
+			args[i] = v
+		}
+		query := "UPDATE `users` SET `del_flg` = 1 WHERE `id` IN (" + placeholder + ")"
+		db.Exec(query, args...)
+
+		query = "UPDATE `posts` SET `user_del_flg` = 1 WHERE `user_id` IN (" + placeholder + ")"
+		db.Exec(query, args...)
+	}
+
 	for _, id := range r.Form["uid[]"] {
-		db.Exec(query, 1, id)
+		// db.Exec(query, 1, id)
 		id, err := strconv.Atoi(id)
 		if err != nil {
 			log.Print(err)
@@ -1034,9 +1074,12 @@ func main() {
 		} else if p.Mime == "image/gif" {
 			ext = "gif"
 		}
-		err = ioutil.WriteFile(fmt.Sprintf("../public/image/%d.%s", p.ID, ext), p.Imgdata, 0644)
-		if err != nil {
-			log.Fatalf("Failed to write image data to file: %s.", err.Error())
+		filename := fmt.Sprintf("../public/image/%d.%s", p.ID, ext)
+		if _, err := os.Stat(filename); os.IsNotExist(err) {
+			err = ioutil.WriteFile(filename, p.Imgdata, 0644)
+			if err != nil {
+				log.Fatalf("Failed to write image data to file: %s.", err.Error())
+			}
 		}
 		count.Store(p.ID, p.CommentCount)
 		postMime.Store(p.ID, p.Mime)
@@ -1065,9 +1108,9 @@ func main() {
 		userCommentCache.Store(commentCount.UserID, commentCount.CommentCount)
 	}
 
-	// go func() {
-	// 	log.Println(http.ListenAndServe(":6060", nil))
-	// }()
+	go func() {
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
 
 	mux := goji.NewMux()
 
